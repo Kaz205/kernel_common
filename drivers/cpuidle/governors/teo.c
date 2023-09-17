@@ -216,7 +216,7 @@ static DEFINE_PER_CPU(struct teo_cpu, teo_cpus);
 #ifdef CONFIG_SMP
 static bool teo_cpu_is_utilized(int cpu, struct teo_cpu *cpu_data)
 {
-	return sched_cpu_util(cpu) > cpu_data->util_threshold;
+	return sched_cpu_util(cpu, arch_scale_cpu_capacity(cpu)) > cpu_data->util_threshold;
 }
 #else
 static bool teo_cpu_is_utilized(int cpu, struct teo_cpu *cpu_data)
