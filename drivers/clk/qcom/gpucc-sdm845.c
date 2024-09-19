@@ -25,8 +25,6 @@
 #define CX_GMU_CBCR_SLEEP_SHIFT		4
 #define CX_GMU_CBCR_WAKE_MASK		0xf
 #define CX_GMU_CBCR_WAKE_SHIFT		8
-#define CLK_DIS_WAIT_SHIFT		12
-#define CLK_DIS_WAIT_MASK		(0xf << CLK_DIS_WAIT_SHIFT)
 
 static DEFINE_VDD_REGULATORS(vdd_cx, VDD_NUM, 1, vdd_corner);
 static DEFINE_VDD_REGULATORS(vdd_mx, VDD_NUM, 1, vdd_corner);
@@ -488,6 +486,7 @@ static struct clk_branch gpu_cc_gx_vsense_clk = {
 static struct gdsc gpu_cx_gdsc = {
 	.gdscr = 0x106c,
 	.gds_hw_ctrl = 0x1540,
+	.clk_dis_wait_val = 0x8,
 	.pd = {
 		.name = "gpu_cx_gdsc",
 	},
@@ -639,6 +638,7 @@ static int gpu_cc_sdm845_probe(struct platform_device *pdev)
 	value = 0xf << CX_GMU_CBCR_WAKE_SHIFT | 0xf << CX_GMU_CBCR_SLEEP_SHIFT;
 	regmap_update_bits(regmap, 0x1098, mask, value);
 
+<<<<<<< HEAD
 	/* Configure clk_dis_wait for gpu_cx_gdsc */
 	regmap_update_bits(regmap, 0x106c, CLK_DIS_WAIT_MASK,
 						8 << CLK_DIS_WAIT_SHIFT);
@@ -656,6 +656,9 @@ static int gpu_cc_sdm845_probe(struct platform_device *pdev)
 static void gpu_cc_sdm845_sync_state(struct device *dev)
 {
 	qcom_cc_sync_state(dev, &gpu_cc_sdm845_desc);
+=======
+	return qcom_cc_really_probe(pdev, &gpu_cc_sdm845_desc, regmap);
+>>>>>>> fuxi
 }
 
 static struct platform_driver gpu_cc_sdm845_driver = {
