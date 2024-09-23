@@ -1953,25 +1953,6 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
 
 }
 
-#ifdef CONFIG_CMA
-/*
- * It is waste of effort to scan and reclaim CMA pages if it is not available
- * for current allocation context. Kswapd can not be enrolled as it can not
- * distinguish this scenario by using sc->gfp_mask = GFP_KERNEL
- */
-static bool skip_cma(struct page *page, struct scan_control *sc)
-{
-	return !current_is_kswapd() &&
-			gfp_migratetype(sc->gfp_mask) != MIGRATE_MOVABLE &&
-			get_pageblock_migratetype(page) == MIGRATE_CMA;
-}
-#else
-static bool skip_cma(struct page *page, struct scan_control *sc)
-{
-	return false;
-}
-#endif
-
 /*
  * Isolating page from the lruvec to fill in @dst list by nr_to_scan times.
  *
@@ -2018,8 +1999,7 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 		nr_pages = compound_nr(page);
 		total_scan += nr_pages;
 
-		if (page_zonenum(page) > sc->reclaim_idx ||
-				skip_cma(page, sc)) {
+		if (page_zonenum(page) > sc->reclaim_idx) {
 			nr_skipped[page_zonenum(page)] += nr_pages;
 			move_to = &pages_skipped;
 			goto move;
@@ -4588,7 +4568,7 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_cont
 	}
 
 	/* ineligible */
-	if (zone > sc->reclaim_idx || skip_cma(page, sc)) {
+	if (zone > sc->reclaim_idx) {
 		gen = page_inc_gen(lruvec, page, false);
 		list_move_tail(&page->lru, &lrugen->lists[gen][type][zone]);
 		return true;
@@ -5948,9 +5928,6 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 
 		shrink_lruvec(lruvec, sc);
 
-		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
-			    sc->priority);
-
 		/* Record the group's reclaim efficiency */
 		vmpressure(sc->gfp_mask, memcg, false,
 			   sc->nr_scanned - scanned,
@@ -6308,7 +6285,7 @@ retry:
 	return 0;
 }
 
-static bool allow_direct_reclaim(pg_data_t *pgdat)
+static bool allow_direct_reclaim(pg_data_t *pgdat, bool using_kswapd)
 {
 	struct zone *zone;
 	unsigned long pfmemalloc_reserve = 0;
@@ -6336,6 +6313,10 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
 		return true;
 
 	wmark_ok = free_pages > pfmemalloc_reserve / 2;
+
+	/* The throttled direct reclaimer is now a kswapd waiter */
+	if (unlikely(!using_kswapd && !wmark_ok))
+		atomic_long_inc(&kswapd_waiters);
 
 	/* kswapd must be awake if processes are being throttled */
 	if (!wmark_ok && waitqueue_active(&pgdat->kswapd_wait)) {
@@ -6402,7 +6383,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 
 		/* Throttle based on the first usable node */
 		pgdat = zone->zone_pgdat;
-		if (allow_direct_reclaim(pgdat))
+		if (allow_direct_reclaim(pgdat, gfp_mask & __GFP_KSWAPD_RECLAIM))
 			goto out;
 		break;
 	}
@@ -6424,12 +6405,14 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	 */
 	if (!(gfp_mask & __GFP_FS))
 		wait_event_interruptible_timeout(pgdat->pfmemalloc_wait,
-			allow_direct_reclaim(pgdat), HZ);
+			allow_direct_reclaim(pgdat, true), HZ);
 	else
 		/* Throttle until kswapd wakes the process */
 		wait_event_killable(zone->zone_pgdat->pfmemalloc_wait,
-			allow_direct_reclaim(pgdat));
+			allow_direct_reclaim(pgdat, true));
 
+	if (unlikely(!(gfp_mask & __GFP_KSWAPD_RECLAIM)))
+		atomic_long_dec(&kswapd_waiters);
 	if (fatal_signal_pending(current))
 		return true;
 
@@ -6922,14 +6905,15 @@ restart:
 		 * able to safely make forward progress. Wake them
 		 */
 		if (waitqueue_active(&pgdat->pfmemalloc_wait) &&
-				allow_direct_reclaim(pgdat))
+				allow_direct_reclaim(pgdat, true))
 			wake_up_all(&pgdat->pfmemalloc_wait);
 
 		/* Check if kswapd should be suspending */
 		__fs_reclaim_release(_THIS_IP_);
 		ret = try_to_freeze();
 		__fs_reclaim_acquire(_THIS_IP_);
-		if (ret || kthread_should_stop())
+		if (ret || kthread_should_stop() ||
+		    !atomic_long_read(&kswapd_waiters))
 			break;
 
 		/*
@@ -7186,6 +7170,43 @@ kswapd_try_sleep:
 }
 EXPORT_SYMBOL_GPL(kswapd);
 
+static int kshrinkd(void *pgdat)
+{
+	pg_data_t *p = pgdat;
+
+	/* This is technically a kswapd thread */
+	current->flags |= PF_KSWAPD;
+	set_freezable();
+	while (1) {
+		unsigned int pri = DEF_PRIORITY;
+		bool stop;
+
+		wait_event_freezable(p->kshrinkd_wait,
+				     (stop = kthread_should_stop()) ||
+				     atomic_long_read(&kshrinkd_waiters));
+		if (unlikely(stop))
+			break;
+
+		/* Shrink slabs on both kswapd and direct reclaimers' behalf */
+		while (1) {
+			struct mem_cgroup *memcg = NULL;
+
+			do {
+				shrink_slab(GFP_KERNEL, p->node_id, memcg, pri);
+			} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
+
+			if (!atomic_long_read(&kshrinkd_waiters))
+				break;
+
+			/* Iterate down each possible priority and then wrap */
+			pri = (pri - 1) % (DEF_PRIORITY + 1);
+		}
+	}
+	current->flags &= ~PF_KSWAPD;
+
+	return 0;
+}
+
 /*
  * A zone is low on free memory or too fragmented for high-order memory.  If
  * kswapd should reclaim (direct reclaim is deferred), wake it up for the zone's
@@ -7236,6 +7257,7 @@ void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
 	trace_mm_vmscan_wakeup_kswapd(pgdat->node_id, highest_zoneidx, order,
 				      gfp_flags);
 	wake_up_interruptible(&pgdat->kswapd_wait);
+	wake_up_interruptible(&pgdat->kshrinkd_wait);
 }
 
 #ifdef CONFIG_HIBERNATION
@@ -7292,12 +7314,24 @@ void kswapd_run(int nid)
 	trace_android_vh_kswapd_per_node(nid, &skip, true);
 	if (skip)
 		return;
+
+	pgdat->kshrinkd = kthread_run(kshrinkd, pgdat, "kshrinkd%d", nid);
+	if (IS_ERR(pgdat->kshrinkd)) {
+		/* failure at boot is fatal */
+		BUG_ON(system_state < SYSTEM_RUNNING);
+		pr_err("Failed to start kshrinkd on node %d\n", nid);
+		pgdat->kshrinkd = NULL;
+		return;
+	}
+
 	pgdat->kswapd = kthread_run(kswapd, pgdat, "kswapd%d", nid);
 	if (IS_ERR(pgdat->kswapd)) {
 		/* failure at boot is fatal */
 		BUG_ON(system_state < SYSTEM_RUNNING);
 		pr_err("Failed to start kswapd on node %d\n", nid);
 		pgdat->kswapd = NULL;
+		kthread_stop(pgdat->kshrinkd);
+		pgdat->kshrinkd = NULL;
 	}
 }
 
@@ -7308,6 +7342,7 @@ void kswapd_run(int nid)
 void kswapd_stop(int nid)
 {
 	struct task_struct *kswapd = NODE_DATA(nid)->kswapd;
+	struct task_struct *kshrinkd = NODE_DATA(nid)->kshrinkd;
 	bool skip = false;
 
 	trace_android_vh_kswapd_per_node(nid, &skip, false);
@@ -7316,6 +7351,11 @@ void kswapd_stop(int nid)
 	if (kswapd) {
 		kthread_stop(kswapd);
 		NODE_DATA(nid)->kswapd = NULL;
+	}
+
+	if (kshrinkd) {
+		kthread_stop(kshrinkd);
+		NODE_DATA(nid)->kshrinkd = NULL;
 	}
 }
 
